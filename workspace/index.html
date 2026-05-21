@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Team Workspace</title>
+
+<!--
+  =====================================================================
+  TEAM WORKSPACE  -  single-file SPA backed by SharePoint via MS Graph
+  =====================================================================
+
+  WHAT THIS IS
+    A lightweight, single-file Notion/Loop-style workspace for a team.
+    All state lives in a SharePoint document library:
+      - Markdown files       -> the pages themselves
+      - SharePoint versions  -> version history (free, native)
+      - SharePoint comments  -> comments / @mentions (free, native)
+      - SharePoint perms     -> access control (free, native)
+
+  ONE-TIME SETUP (5-10 min)
+    1. Register an app in Microsoft Entra ID (Azure AD):
+         Entra ID > App registrations > New registration
+         Name:                 "Team Workspace"
+         Supported accounts:   Single tenant
+         Redirect URI:         Platform = "Single-page application"
+                               URL     = the URL where this file will
+                                         be served (e.g. the SharePoint
+                                         file URL or your Azure Static
+                                         Web App URL).
+    2. Under API permissions, add Microsoft Graph DELEGATED:
+         Files.ReadWrite.All
+         Sites.Read.All
+         User.Read
+       Click "Grant admin consent" if you have rights, otherwise ask IT.
+    3. Copy the Application (client) ID and Directory (tenant) ID into
+       the CONFIG block below.
+    4. In the target SharePoint team site, create (or pick) a document
+       library and a subfolder for the markdown files. Put the path
+       into CONFIG.sitePath / CONFIG.driveName / CONFIG.folderPath.
+    5. Upload this index.html to anywhere your team can reach (the
+       SharePoint Site Assets library is a good spot - no spaces in
+       the URL). Make sure that URL matches the redirect URI from
+       step 1 exactly.
+
+  CAVEATS
+    - Many tenants disable custom scripts on modern SharePoint sites.
+      If clicking index.html in SharePoint opens a preview instead of
+      running the page, host it on Azure Static Web Apps / GitHub Pages
+      and embed it into a SharePoint page via the Embed web part.
+    - This is delegated-auth only: every user signs in as themselves
+      and sees only what they already have SharePoint permission to see.
+
+  TECH
+    MSAL.js for auth, Microsoft Graph for I/O, markdown-it + DOMPurify
+    for safe rendering, EasyMDE for editing, MiniSearch for search.
+    All loaded from CDN - no build step.
+  =====================================================================
+-->
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde@2.18.0/dist/easymde.min.css" />
+<script defer src="https://alcdn.msauth.net/browser/3.27.0/js/msal-browser.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/easymde@2.18.0/dist/easymde.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/minisearch@7.1.0/dist/umd/index.min.js"></script>
+
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-alt: #f6f7f9;
+    --border: #e5e7eb;
+    --text: #111827;
+    --muted: #6b7280;
+    --accent: #1f6feb;
+    --accent-soft: #e7f0ff;
+    --danger: #b91c1c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: var(--sans); color: var(--text); background: var(--bg); font-size: 14px; line-height: 1.55; }
+  button { font: inherit; cursor: pointer; }
+
+  header.app {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--bg); position: sticky; top: 0; z-index: 5;
+  }
+  header.app h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header.app .spacer { flex: 1; }
+  header.app .who { color: var(--muted); font-size: 13px; }
+  header.app button {
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    padding: 6px 12px; border-radius: 6px;
+  }
+  header.app button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  header.app button:hover { background: var(--bg-alt); }
+  header.app button.primary:hover { background: #1857c0; }
+
+  main.layout { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 51px); }
+
+  aside.sidebar {
+    border-right: 1px solid var(--border); background: var(--bg-alt);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  aside.sidebar .search { padding: 10px; border-bottom: 1px solid var(--border); }
+  aside.sidebar .search input {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--bg); font: inherit;
+  }
+  aside.sidebar .actions {
+    display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  aside.sidebar .actions button {
+    flex: 1; border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 12px;
+  }
+  aside.sidebar .actions button:hover { background: var(--accent-soft); }
+  aside.sidebar .tree { flex: 1; overflow: auto; padding: 6px 4px; }
+  .tree .node {
+    padding: 5px 10px; border-radius: 4px; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 13px;
+  }
+  .tree .node:hover { background: var(--bg); }
+  .tree .node.active { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+  .tree .folder { color: var(--muted); font-size: 12px; padding: 8px 10px 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .tree .empty { color: var(--muted); padding: 10px; font-style: italic; font-size: 13px; }
+  .tree .search-hit-snippet { color: var(--muted); font-size: 11px; padding: 0 10px 4px; white-space: normal; }
+
+  section.content { overflow: auto; min-height: 0; }
+  section.content .toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 20px; border-bottom: 1px solid var(--border);
+    background: var(--bg); position: sticky; top: 0; z-index: 2;
+  }
+  section.content .toolbar .title { font-weight: 600; font-size: 14px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  section.content .toolbar .saved { color: var(--muted); font-size: 12px; }
+  section.content .toolbar button {
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); padding: 5px 10px; border-radius: 6px; font-size: 13px;
+  }
+  section.content .toolbar button:hover { background: var(--bg-alt); }
+  section.content .toolbar button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  section.content .toolbar button.primary:hover { background: #1857c0; }
+  section.content .toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .markdown { padding: 28px 40px 80px; max-width: 880px; }
+  .markdown h1 { font-size: 28px; margin: 0 0 16px; }
+  .markdown h2 { font-size: 22px; margin: 28px 0 12px; }
+  .markdown h3 { font-size: 17px; margin: 22px 0 8px; }
+  .markdown p { margin: 0 0 14px; }
+  .markdown a { color: var(--accent); }
+  .markdown code { font-family: var(--mono); background: var(--bg-alt); padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  .markdown pre { background: var(--bg-alt); padding: 12px 14px; border-radius: 6px; overflow: auto; font-size: 13px; }
+  .markdown pre code { background: none; padding: 0; }
+  .markdown blockquote { border-left: 3px solid var(--border); margin: 0 0 14px; padding: 4px 14px; color: var(--muted); }
+  .markdown table { border-collapse: collapse; margin: 0 0 14px; }
+  .markdown table th, .markdown table td { border: 1px solid var(--border); padding: 6px 10px; }
+  .markdown table th { background: var(--bg-alt); }
+  .markdown img { max-width: 100%; }
+
+  .editor-wrap { padding: 16px 20px; }
+  .editor-wrap .EasyMDEContainer .editor-toolbar { border-radius: 6px 6px 0 0; }
+  .editor-wrap .CodeMirror { border-radius: 0 0 6px 6px; height: calc(100vh - 200px); }
+
+  .empty-state {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--muted); flex-direction: column; gap: 8px;
+    padding: 40px;
+  }
+  .empty-state h2 { margin: 0; font-size: 18px; color: var(--text); }
+
+  .drop-overlay {
+    position: fixed; inset: 0; background: rgba(31, 111, 235, 0.08);
+    border: 3px dashed var(--accent); pointer-events: none; z-index: 100;
+    display: none; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 600; color: var(--accent);
+  }
+  body.dragging .drop-overlay { display: flex; }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(17, 24, 39, 0.5);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--bg); border-radius: 8px; max-width: 560px;
+    width: 90%; max-height: 80vh; overflow: auto;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+  }
+  .modal header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; }
+  .modal header h3 { margin: 0; font-size: 15px; flex: 1; }
+  .modal header button { background: none; border: none; font-size: 20px; color: var(--muted); }
+  .modal .body { padding: 6px 0; }
+  .version-row {
+    padding: 10px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .version-row:last-child { border-bottom: none; }
+  .version-row .meta { flex: 1; }
+  .version-row .who { font-size: 13px; }
+  .version-row .when { font-size: 12px; color: var(--muted); }
+  .version-row button { border: 1px solid var(--border); background: var(--bg); padding: 5px 10px; border-radius: 6px; font-size: 12px; }
+
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--text);
+    color: white; padding: 10px 16px; border-radius: 6px; font-size: 13px;
+    z-index: 100; opacity: 0; transition: opacity 0.2s; pointer-events: none;
+  }
+  .toast.show { opacity: 0.95; }
+  .toast.error { background: var(--danger); }
+
+  .config-warning {
+    background: #fff4d6; border: 1px solid #f0c674; color: #6b4d00;
+    padding: 14px 20px; margin: 20px; border-radius: 6px;
+  }
+  .config-warning code { background: rgba(0,0,0,0.06); padding: 2px 5px; border-radius: 3px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header class="app">
+  <h1>Team Workspace</h1>
+  <span class="who" id="who"></span>
+  <span class="spacer"></span>
+  <button id="signin-btn" class="primary" hidden>Sign in</button>
+  <button id="signout-btn" hidden>Sign out</button>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="search">
+      <input id="search-input" type="search" placeholder="Search pages..." autocomplete="off" />
+    </div>
+    <div class="actions">
+      <button id="new-btn" title="Create a new markdown page">+ New page</button>
+      <button id="upload-btn" title="Upload .md file(s)">Upload</button>
+      <input id="file-input" type="file" accept=".md,.markdown,text/markdown" multiple hidden />
+    </div>
+    <div class="tree" id="tree">
+      <div class="empty">Sign in to load pages.</div>
+    </div>
+  </aside>
+
+  <section class="content" id="content">
+    <div class="empty-state">
+      <h2>Welcome</h2>
+      <div>Sign in with your work account to get started.</div>
+    </div>
+  </section>
+</main>
+
+<div class="drop-overlay">Drop .md files to upload</div>
+
+<div class="modal-backdrop" id="versions-modal">
+  <div class="modal">
+    <header>
+      <h3>Version history</h3>
+      <button data-close>&times;</button>
+    </header>
+    <div class="body" id="versions-body"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ====================== CONFIG ====================== */
+/* Fill these in after the one-time setup at the top of the file. */
+const CONFIG = {
+  clientId:   "00000000-0000-0000-0000-000000000000", // Entra app (client) ID
+  tenantId:   "00000000-0000-0000-0000-000000000000", // Directory (tenant) ID
+  siteHost:   "yourtenant.sharepoint.com",             // tenant host
+  sitePath:   "/sites/YourTeamSite",                   // /sites/<your-team-site>
+  driveName:  "Documents",                             // doc library display name
+  folderPath: "Workspace",                             // subfolder for .md files ("" = library root)
+};
+/* ==================================================== */
+
+const GRAPH = "https://graph.microsoft.com/v1.0";
+const SCOPES = ["Files.ReadWrite.All", "Sites.Read.All", "User.Read"];
+
+/* ------- tiny helpers ------- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const escapeHtml = s => s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function toast(msg, isError = false) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.classList.toggle("error", isError);
+  el.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("show"), 2500);
+}
+
+function isConfigured() {
+  return CONFIG.clientId && !CONFIG.clientId.startsWith("00000000")
+      && CONFIG.tenantId && !CONFIG.tenantId.startsWith("00000000")
+      && CONFIG.siteHost && !CONFIG.siteHost.startsWith("yourtenant");
+}
+
+/* ------- app state ------- */
+const state = {
+  msal: null,
+  account: null,
+  siteId: null,
+  driveId: null,
+  folderId: null,
+  items: [],         // {id, name, path, lastModified, webUrl}
+  currentItem: null,
+  currentContent: "",
+  editor: null,
+  md: null,
+  searchIndex: null,
+};
+
+/* ------- Graph fetch ------- */
+async function getToken() {
+  const req = { scopes: SCOPES, account: state.account };
+  try {
+    const r = await state.msal.acquireTokenSilent(req);
+    return r.accessToken;
+  } catch (e) {
+    const r = await state.msal.acquireTokenPopup(req);
+    return r.accessToken;
+  }
+}
+
+async function graph(path, opts = {}) {
+  const token = await getToken();
+  const headers = { Authorization: `Bearer ${token}`, ...(opts.headers || {}) };
+  if (opts.body && !(opts.body instanceof Blob) && !(opts.body instanceof ArrayBuffer) && typeof opts.body !== "string") {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const url = path.startsWith("http") ? path : `${GRAPH}${path}`;
+  const res = await fetch(url, { ...opts, headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Graph ${res.status}: ${text || res.statusText}`);
+  }
+  if (res.status === 204) return null;
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("application/json") ? res.json() : res.text();
+}
+
+/* ------- discovery: site -> drive -> folder ------- */
+async function resolveLocation() {
+  // 1. site by host + path
+  const site = await graph(`/sites/${CONFIG.siteHost}:${CONFIG.sitePath}`);
+  state.siteId = site.id;
+
+  // 2. drive in that site matching driveName
+  const drives = await graph(`/sites/${state.siteId}/drives`);
+  const drive = drives.value.find(d => d.name === CONFIG.driveName) || drives.value[0];
+  if (!drive) throw new Error(`No drive named "${CONFIG.driveName}" found in site.`);
+  state.driveId = drive.id;
+
+  // 3. folder (create on first use if missing)
+  if (CONFIG.folderPath) {
+    try {
+      const folder = await graph(`/drives/${state.driveId}/root:/${encodeURIComponent(CONFIG.folderPath)}`);
+      state.folderId = folder.id;
+    } catch (e) {
+      const folder = await graph(`/drives/${state.driveId}/root/children`, {
+        method: "POST",
+        body: { name: CONFIG.folderPath, folder: {}, "@microsoft.graph.conflictBehavior": "fail" },
+      });
+      state.folderId = folder.id;
+    }
+  } else {
+    const root = await graph(`/drives/${state.driveId}/root`);
+    state.folderId = root.id;
+  }
+}
+
+/* ------- list markdown files (recursive) ------- */
+async function listMarkdown() {
+  const out = [];
+  async function walk(itemId, prefix) {
+    let url = `/drives/${state.driveId}/items/${itemId}/children?$top=200&$select=id,name,folder,file,lastModifiedDateTime,lastModifiedBy,webUrl`;
+    while (url) {
+      const page = await graph(url);
+      for (const c of page.value) {
+        if (c.folder) {
+          await walk(c.id, `${prefix}${c.name}/`);
+        } else if (c.file && /\.(md|markdown)$/i.test(c.name)) {
+          out.push({
+            id: c.id,
+            name: c.name,
+            path: `${prefix}${c.name}`,
+            folder: prefix.replace(/\/$/, "") || "",
+            lastModified: c.lastModifiedDateTime,
+            lastModifiedBy: c.lastModifiedBy?.user?.displayName || "",
+            webUrl: c.webUrl,
+          });
+        }
+      }
+      url = page["@odata.nextLink"] || null;
+    }
+  }
+  await walk(state.folderId, "");
+  out.sort((a, b) => a.path.localeCompare(b.path));
+  state.items = out;
+}
+
+/* ------- sidebar render ------- */
+function renderTree(filterQuery = "") {
+  const tree = $("#tree");
+  tree.innerHTML = "";
+
+  let items = state.items;
+  let searchHits = null;
+  if (filterQuery && state.searchIndex) {
+    searchHits = state.searchIndex.search(filterQuery, { prefix: true, fuzzy: 0.2 });
+    const hitIds = new Set(searchHits.map(h => h.id));
+    items = state.items.filter(i => hitIds.has(i.id));
+  }
+
+  if (!items.length) {
+    tree.innerHTML = `<div class="empty">${filterQuery ? "No matches." : "No pages yet. Click + New page or Upload."}</div>`;
+    return;
+  }
+
+  const byFolder = new Map();
+  for (const it of items) {
+    const f = it.folder || "";
+    if (!byFolder.has(f)) byFolder.set(f, []);
+    byFolder.get(f).push(it);
+  }
+
+  for (const [folder, list] of [...byFolder.entries()].sort()) {
+    if (folder) {
+      const h = document.createElement("div");
+      h.className = "folder";
+      h.textContent = folder;
+      tree.appendChild(h);
+    }
+    for (const it of list) {
+      const n = document.createElement("div");
+      n.className = "node" + (state.currentItem?.id === it.id ? " active" : "");
+      n.textContent = it.name.replace(/\.(md|markdown)$/i, "");
+      n.title = it.path;
+      n.onclick = () => openItem(it);
+      tree.appendChild(n);
+    }
+  }
+}
+
+/* ------- search index ------- */
+async function buildSearchIndex() {
+  state.searchIndex = new MiniSearch({
+    fields: ["name", "body"],
+    storeFields: ["id", "name"],
+    searchOptions: { boost: { name: 3 } },
+  });
+  // Add metadata only - bodies are lazy-loaded as files are opened.
+  state.searchIndex.addAll(state.items.map(i => ({ id: i.id, name: i.name, body: "" })));
+}
+
+function indexBody(item, body) {
+  if (!state.searchIndex) return;
+  if (state.searchIndex.has(item.id)) state.searchIndex.discard(item.id);
+  state.searchIndex.add({ id: item.id, name: item.name, body });
+}
+
+/* ------- open / view / edit ------- */
+async function openItem(item) {
+  state.currentItem = item;
+  renderTree($("#search-input").value);
+  const content = $("#content");
+  content.innerHTML = `<div class="empty-state">Loading...</div>`;
+  try {
+    const text = await graph(`/drives/${state.driveId}/items/${item.id}/content`);
+    state.currentContent = typeof text === "string" ? text : "";
+    indexBody(item, state.currentContent);
+    renderView();
+  } catch (e) {
+    content.innerHTML = `<div class="empty-state"><h2>Couldn't load page</h2><div>${escapeHtml(e.message)}</div></div>`;
+  }
+}
+
+function renderView() {
+  const item = state.currentItem;
+  const content = $("#content");
+  const html = DOMPurify.sanitize(state.md.render(state.currentContent || ""));
+  content.innerHTML = `
+    <div class="toolbar">
+      <span class="title">${escapeHtml(item.path)}</span>
+      <span class="saved">Updated ${new Date(item.lastModified).toLocaleString()}</span>
+      <button id="versions-btn">Versions</button>
+      <button id="open-sp-btn">Open in SharePoint</button>
+      <button id="edit-btn" class="primary">Edit</button>
+    </div>
+    <div class="markdown">${html}</div>
+  `;
+  $("#edit-btn").onclick = renderEditor;
+  $("#versions-btn").onclick = () => showVersions(item);
+  $("#open-sp-btn").onclick = () => window.open(item.webUrl, "_blank", "noopener");
+}
+
+function renderEditor() {
+  const item = state.currentItem;
+  const content = $("#content");
+  content.innerHTML = `
+    <div class="toolbar">
+      <span class="title">Editing: ${escapeHtml(item.path)}</span>
+      <span class="saved" id="save-status"></span>
+      <button id="cancel-btn">Cancel</button>
+      <button id="save-btn" class="primary">Save</button>
+    </div>
+    <div class="editor-wrap"><textarea id="editor-area"></textarea></div>
+  `;
+  state.editor = new EasyMDE({
+    element: $("#editor-area"),
+    initialValue: state.currentContent,
+    spellChecker: false,
+    status: false,
+    autoDownloadFontAwesome: false,
+    toolbar: ["bold","italic","heading","|","quote","unordered-list","ordered-list","|","link","code","table","|","preview","guide"],
+  });
+  $("#cancel-btn").onclick = renderView;
+  $("#save-btn").onclick = saveCurrent;
+}
+
+async function saveCurrent() {
+  const item = state.currentItem;
+  const newText = state.editor.value();
+  $("#save-btn").disabled = true;
+  $("#save-status").textContent = "Saving...";
+  try {
+    const updated = await graph(`/drives/${state.driveId}/items/${item.id}/content`, {
+      method: "PUT",
+      headers: { "Content-Type": "text/markdown" },
+      body: newText,
+    });
+    state.currentContent = newText;
+    item.lastModified = updated.lastModifiedDateTime;
+    indexBody(item, newText);
+    toast("Saved.");
+    renderView();
+  } catch (e) {
+    $("#save-btn").disabled = false;
+    $("#save-status").textContent = "";
+    toast(`Save failed: ${e.message}`, true);
+  }
+}
+
+/* ------- new page ------- */
+async function createPage() {
+  const name = prompt("Page name (without .md):");
+  if (!name) return;
+  const fileName = /\.md$/i.test(name) ? name : `${name}.md`;
+  const body = `# ${name}\n\n`;
+  try {
+    const created = await graph(
+      `/drives/${state.driveId}/items/${state.folderId}:/${encodeURIComponent(fileName)}:/content`,
+      { method: "PUT", headers: { "Content-Type": "text/markdown" }, body }
+    );
+    await listMarkdown();
+    await buildSearchIndex();
+    const item = state.items.find(i => i.id === created.id);
+    if (item) openItem(item); else renderTree();
+  } catch (e) {
+    toast(`Couldn't create page: ${e.message}`, true);
+  }
+}
+
+/* ------- upload ------- */
+async function uploadFiles(files) {
+  let ok = 0, fail = 0;
+  for (const f of files) {
+    if (!/\.(md|markdown)$/i.test(f.name)) { fail++; continue; }
+    try {
+      const text = await f.text();
+      await graph(
+        `/drives/${state.driveId}/items/${state.folderId}:/${encodeURIComponent(f.name)}:/content`,
+        { method: "PUT", headers: { "Content-Type": "text/markdown" }, body: text }
+      );
+      ok++;
+    } catch (e) {
+      fail++;
+      console.error("upload failed:", f.name, e);
+    }
+  }
+  await listMarkdown();
+  await buildSearchIndex();
+  renderTree($("#search-input").value);
+  toast(`Uploaded ${ok}${fail ? `, ${fail} failed` : ""}.`, fail > 0 && ok === 0);
+}
+
+/* ------- versions ------- */
+async function showVersions(item) {
+  const modal = $("#versions-modal");
+  const body = $("#versions-body");
+  body.innerHTML = `<div class="empty" style="padding:20px">Loading...</div>`;
+  modal.classList.add("open");
+  try {
+    const r = await graph(`/drives/${state.driveId}/items/${item.id}/versions?$top=50`);
+    if (!r.value.length) { body.innerHTML = `<div class="empty" style="padding:20px">No versions yet.</div>`; return; }
+    body.innerHTML = "";
+    for (const v of r.value) {
+      const row = document.createElement("div");
+      row.className = "version-row";
+      const who = v.lastModifiedBy?.user?.displayName || "Unknown";
+      const when = new Date(v.lastModifiedDateTime).toLocaleString();
+      row.innerHTML = `
+        <div class="meta">
+          <div class="who">${escapeHtml(who)}</div>
+          <div class="when">${escapeHtml(when)} &middot; v${escapeHtml(v.id)}</div>
+        </div>
+      `;
+      const viewBtn = document.createElement("button");
+      viewBtn.textContent = "View";
+      viewBtn.onclick = async () => {
+        try {
+          const text = await graph(`/drives/${state.driveId}/items/${item.id}/versions/${v.id}/content`);
+          state.currentContent = typeof text === "string" ? text : "";
+          modal.classList.remove("open");
+          renderView();
+          toast(`Showing v${v.id} (read-only preview). Press Edit then Save to restore.`);
+        } catch (e) {
+          toast(`Couldn't load version: ${e.message}`, true);
+        }
+      };
+      row.appendChild(viewBtn);
+      body.appendChild(row);
+    }
+  } catch (e) {
+    body.innerHTML = `<div class="empty" style="padding:20px">Couldn't load versions: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ------- auth flow ------- */
+async function initAuth() {
+  state.msal = new msal.PublicClientApplication({
+    auth: {
+      clientId: CONFIG.clientId,
+      authority: `https://login.microsoftonline.com/${CONFIG.tenantId}`,
+      redirectUri: window.location.origin + window.location.pathname,
+    },
+    cache: { cacheLocation: "sessionStorage" },
+  });
+  await state.msal.initialize();
+  const accounts = state.msal.getAllAccounts();
+  if (accounts.length) {
+    state.account = accounts[0];
+    state.msal.setActiveAccount(state.account);
+    await onSignedIn();
+  } else {
+    showSignedOut();
+  }
+}
+
+function showSignedOut() {
+  $("#signin-btn").hidden = false;
+  $("#signout-btn").hidden = true;
+  $("#who").textContent = "";
+  $("#tree").innerHTML = `<div class="empty">Sign in to load pages.</div>`;
+  $("#content").innerHTML = `<div class="empty-state"><h2>Welcome</h2><div>Sign in with your work account to get started.</div></div>`;
+}
+
+async function onSignedIn() {
+  $("#signin-btn").hidden = true;
+  $("#signout-btn").hidden = false;
+  $("#who").textContent = state.account.username;
+  $("#content").innerHTML = `<div class="empty-state">Loading workspace...</div>`;
+  try {
+    await resolveLocation();
+    await listMarkdown();
+    await buildSearchIndex();
+    renderTree();
+    $("#content").innerHTML = `
+      <div class="empty-state">
+        <h2>Pick a page</h2>
+        <div>Choose one from the left, or upload .md files to get started.</div>
+      </div>`;
+  } catch (e) {
+    $("#content").innerHTML = `
+      <div class="empty-state">
+        <h2>Setup needed</h2>
+        <div>${escapeHtml(e.message)}</div>
+        <div style="margin-top:8px">Check the CONFIG block in this file.</div>
+      </div>`;
+  }
+}
+
+async function signIn() {
+  try {
+    const r = await state.msal.loginPopup({ scopes: SCOPES });
+    state.account = r.account;
+    state.msal.setActiveAccount(state.account);
+    await onSignedIn();
+  } catch (e) {
+    toast(`Sign-in failed: ${e.message}`, true);
+  }
+}
+
+function signOut() {
+  state.msal.logoutPopup({ account: state.account }).finally(() => {
+    state.account = null;
+    state.currentItem = null;
+    state.items = [];
+    showSignedOut();
+  });
+}
+
+/* ------- wire up ------- */
+window.addEventListener("DOMContentLoaded", () => {
+  // Wait for deferred scripts.
+  function ready() {
+    return window.msal && window.markdownit && window.DOMPurify && window.EasyMDE && window.MiniSearch;
+  }
+  function boot() {
+    if (!ready()) { setTimeout(boot, 50); return; }
+
+    state.md = window.markdownit({ html: false, linkify: true, breaks: false, typographer: true });
+
+    if (!isConfigured()) {
+      $("#content").innerHTML = `
+        <div class="config-warning">
+          <strong>Configuration needed.</strong><br>
+          Open this file in a text editor and fill in the <code>CONFIG</code> block
+          near the top of the &lt;script&gt; tag (clientId, tenantId, siteHost, sitePath).
+          See the comment block at the top of the file for one-time setup steps.
+        </div>`;
+      return;
+    }
+
+    initAuth();
+  }
+  boot();
+
+  $("#signin-btn").addEventListener("click", signIn);
+  $("#signout-btn").addEventListener("click", signOut);
+  $("#new-btn").addEventListener("click", () => state.account && createPage());
+  $("#upload-btn").addEventListener("click", () => state.account && $("#file-input").click());
+  $("#file-input").addEventListener("change", e => {
+    if (e.target.files.length) uploadFiles(Array.from(e.target.files));
+    e.target.value = "";
+  });
+  $("#search-input").addEventListener("input", e => renderTree(e.target.value.trim()));
+
+  // close modals
+  document.addEventListener("click", e => {
+    if (e.target.matches("[data-close]") || e.target.classList.contains("modal-backdrop")) {
+      $$(".modal-backdrop").forEach(m => m.classList.remove("open"));
+    }
+  });
+
+  // drag-drop upload
+  let dragDepth = 0;
+  window.addEventListener("dragenter", e => {
+    if (!state.account) return;
+    if ([...e.dataTransfer.types].includes("Files")) {
+      dragDepth++;
+      document.body.classList.add("dragging");
+    }
+  });
+  window.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) document.body.classList.remove("dragging");
+  });
+  window.addEventListener("dragover", e => e.preventDefault());
+  window.addEventListener("drop", e => {
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove("dragging");
+    if (!state.account) return;
+    const files = [...(e.dataTransfer.files || [])];
+    if (files.length) uploadFiles(files);
+  });
+});
+</script>
+</body>
+</html>
