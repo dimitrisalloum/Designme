@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Test Page</title>
+  <style>
+    :root {
+      --accent: #4f46e5;
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #e2e8f0;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 2.5rem 3rem;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+      max-width: 480px;
+      text-align: center;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 0.75rem; }
+    p { color: #94a3b8; margin-bottom: 1.5rem; line-height: 1.6; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.75rem 1.5rem;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.2s ease;
+    }
+    button:hover { background: #4338ca; }
+    button:active { transform: scale(0.97); }
+    #output { margin-top: 1.25rem; font-weight: 600; min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>👋 Test Page</h1>
+    <p>This is a test HTML page created for the Designme project. If you can read this, the page is working.</p>
+    <button id="clickBtn">Click me</button>
+    <div id="output"></div>
+  </main>
+
+  <script>
+    const btn = document.getElementById('clickBtn');
+    const output = document.getElementById('output');
+    let count = 0;
+    btn.addEventListener('click', () => {
+      count++;
+      output.textContent = count === 1
+        ? 'It works! 🎉'
+        : `Clicked ${count} times`;
+    });
+  </script>
+</body>
+</html>
